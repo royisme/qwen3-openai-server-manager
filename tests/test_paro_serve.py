@@ -6,10 +6,12 @@ from qwen3_server_manager.paro_serve import (
     CallableTokenizerProxy,
     CompatibleQwenVLMProcessor,
     _RESPONSE_STORE,
+    _apply_reasoning_aliases,
     _delete_response,
     _normalize_responses_input,
     _response_store_path,
     _save_response_store,
+    _sanitize_output_text,
     _load_response_store,
     _stored_messages_from_response,
 )
@@ -129,3 +131,26 @@ class ResponseStoreTests(unittest.TestCase):
                     os.environ.pop('QWEN3_RUNTIME_DIR', None)
                 else:
                     os.environ['QWEN3_RUNTIME_DIR'] = old
+
+
+class ReasoningAliasTests(unittest.TestCase):
+    def test_enable_thinking_false_passthrough(self) -> None:
+        kwargs = {}
+        _apply_reasoning_aliases({'enable_thinking': False}, kwargs)
+        self.assertEqual(kwargs['enable_thinking'], False)
+
+    def test_reasoning_enabled_false_maps_to_no_thinking(self) -> None:
+        kwargs = {}
+        _apply_reasoning_aliases({'reasoning': {'enabled': False}}, kwargs)
+        self.assertEqual(kwargs['enable_thinking'], False)
+
+    def test_no_thinking_true_maps_to_no_thinking(self) -> None:
+        kwargs = {}
+        _apply_reasoning_aliases({'no_thinking': True}, kwargs)
+        self.assertEqual(kwargs['enable_thinking'], False)
+
+
+class OutputSanitizerTests(unittest.TestCase):
+    def test_sanitize_output_text_removes_special_tokens(self) -> None:
+        text = 'OK<|im_end|>\n<|endoftext|>'
+        self.assertEqual(_sanitize_output_text(text), 'OK\n')

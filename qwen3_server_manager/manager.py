@@ -439,7 +439,14 @@ class ServerManager:
         plist_path = self.service_plist_path(label, launch_agents_dir)
         if plist_path.exists():
             self.run_command(['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(plist_path)], check=False)
-        self.run_command(['launchctl', 'kickstart', '-k', self.service_target(label)])
+        result = self.run_command(['launchctl', 'kickstart', '-k', self.service_target(label)], check=False)
+        if result.returncode != 0:
+            time.sleep(0.5)
+            status = self.service_status(label, check_platform=False)
+            if not status.get('ok'):
+                raise RuntimeError(
+                    f"launchctl kickstart failed for {label}: {result.stderr.strip() or result.stdout.strip() or 'unknown error'}"
+                )
         return {'ok': True, 'label': label, 'target': self.service_target(label)}
 
     def stop_service(self, label: str = DEFAULT_SERVICE_LABEL) -> dict[str, Any]:
@@ -450,6 +457,7 @@ class ServerManager:
 
     def restart_service(self, label: str = DEFAULT_SERVICE_LABEL, launch_agents_dir: str | None = None) -> dict[str, Any]:
         self.stop_service(label)
+        time.sleep(0.5)
         return self.start_service(label, launch_agents_dir)
 
     def service_status(self, label: str = DEFAULT_SERVICE_LABEL, check_platform: bool = True) -> dict[str, Any]:

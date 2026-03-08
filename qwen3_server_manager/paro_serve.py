@@ -168,6 +168,11 @@ def _serve_mlx_text():
 
 _RESPONSE_STORE: dict[str, dict] = {}
 
+_SPECIAL_OUTPUT_TOKENS = (
+    '<|im_end|>',
+    '<|endoftext|>',
+)
+
 
 def _response_store_path() -> Path:
     runtime_dir = Path(os.environ.get('QWEN3_RUNTIME_DIR', '.runtime/qwen3-server-manager'))
@@ -223,6 +228,28 @@ def _extract_image_url(value):
         return value.get('url') or value.get('image_url')
     return None
 
+
+def _apply_reasoning_aliases(body: dict, kwargs: dict) -> None:
+    if body.get('enable_thinking') is False:
+        kwargs['enable_thinking'] = False
+        return
+    reasoning = body.get('reasoning')
+    no_thinking = body.get('no_thinking')
+    if no_thinking is True:
+        kwargs['enable_thinking'] = False
+        return
+    if isinstance(reasoning, dict):
+        if reasoning.get('enabled') is False:
+            kwargs['enable_thinking'] = False
+        elif reasoning.get('effort') in {'none', 'minimal'}:
+            kwargs['enable_thinking'] = False
+
+
+def _sanitize_output_text(text: str) -> str:
+    sanitized = text
+    for token in _SPECIAL_OUTPUT_TOKENS:
+        sanitized = sanitized.replace(token, '')
+    return sanitized
 
 def _normalize_responses_input(input_value):
     messages: list[dict] = []
@@ -330,8 +357,48 @@ def _patch_responses_routes(server_module) -> None:
     app.router.routes = [
         route
         for route in app.router.routes
-        if getattr(route, 'path', None) not in {'/responses', '/v1/responses', '/responses/{response_id}', '/v1/responses/{response_id}'}
+        if getattr(route, 'path', None) not in {
+            '/responses',
+            '/v1/responses',
+            '/responses/{response_id}',
+            '/v1/responses/{response_id}',
+            '/chat/completions',
+            '/v1/chat/completions',
+        }
     ]
+
+    original_chat_endpoint = getattr(server_module, 'chat_completions_endpoint', None)
+
+    @app.post('/chat/completions', response_model=None)
+    @app.post('/v1/chat/completions', response_model=None, include_in_schema=False)
+    async def patched_chat_completions_endpoint(body: dict = Body(...)):
+        if original_chat_endpoint is None:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    'message': 'chat completions endpoint is unavailable',
+                    'type': 'server_error',
+                    'param': None,
+                    'code': None,
+                },
+            )
+        try:
+            request_model = server_module.ChatRequest.model_validate(body)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    'message': str(exc),
+                    'type': 'invalid_request_error',
+                    'param': 'body',
+                    'code': None,
+                },
+            )
+
+        extras = dict(getattr(request_model, '__pydantic_extra__', {}) or {})
+        _apply_reasoning_aliases(body, extras)
+        request_model.__pydantic_extra__ = extras
+        return await original_chat_endpoint(request_model)
 
     @app.post('/responses')
     @app.post('/v1/responses', include_in_schema=False)
@@ -373,6 +440,7 @@ def _patch_responses_routes(server_module) -> None:
             for key, value in body.items()
             if key in server_module.ALLOWED_TEMPLATE_KWARGS
         }
+        _apply_reasoning_aliases(body, template_kwargs)
         formatted_prompt = server_module.apply_chat_template(
             processor,
             config,
@@ -382,6 +450,7 @@ def _patch_responses_routes(server_module) -> None:
         )
 
         kwargs = dict(template_kwargs)
+        _apply_reasoning_aliases(body, kwargs)
         generated_at = int(time.time())
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -433,6 +502,7 @@ def _patch_responses_routes(server_module) -> None:
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, 'text'):
                             continue
+                        chunk.text = _sanitize_output_text(chunk.text)
                         full_text += chunk.text
                         usage = {
                             'input_tokens': chunk.prompt_tokens,
@@ -491,8 +561,8 @@ def _patch_responses_routes(server_module) -> None:
                 'instructions': instructions,
                 'max_output_tokens': max_output_tokens,
                 'model': model_name,
-                'output': [_assistant_output_message(result.text, message_id)],
-                'output_text': result.text,
+                'output': [_assistant_output_message(_sanitize_output_text(result.text), message_id)],
+                'output_text': _sanitize_output_text(result.text),
                 'temperature': temperature,
                 'top_p': top_p,
                 'truncation': 'disabled',
@@ -504,7 +574,12 @@ def _patch_responses_routes(server_module) -> None:
                 'user': body.get('user'),
             }
             if store:
-                _store_response(response_id, response, chat_messages + [{'role': 'assistant', 'content': result.text}], generated_at)
+                _store_response(
+                    response_id,
+                    response,
+                    chat_messages + [{'role': 'assistant', 'content': _sanitize_output_text(result.text)}],
+                    generated_at,
+                )
             server_module.mx.clear_cache()
             server_module.gc.collect()
             return JSONResponse(response)
@@ -574,6 +649,24 @@ def _serve_mlx_vlm():
 
     mlx_vlm.server.load = _patched_load
     _patch_responses_routes(mlx_vlm.server)
+
+    original_generate = mlx_vlm.server.generate
+    original_stream_generate = mlx_vlm.server.stream_generate
+
+    def patched_generate(*args, **kwargs):
+        result = original_generate(*args, **kwargs)
+        if hasattr(result, 'text'):
+            result.text = _sanitize_output_text(result.text)
+        return result
+
+    def patched_stream_generate(*args, **kwargs):
+        for chunk in original_stream_generate(*args, **kwargs):
+            if chunk is not None and hasattr(chunk, 'text'):
+                chunk.text = _sanitize_output_text(chunk.text)
+            yield chunk
+
+    mlx_vlm.server.generate = patched_generate
+    mlx_vlm.server.stream_generate = patched_stream_generate
     uvicorn.run(mlx_vlm.server.app, host=args.host, port=args.port, workers=1, reload=False)
 
 

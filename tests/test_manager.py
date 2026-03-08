@@ -196,3 +196,53 @@ class ManagerTests(unittest.TestCase):
                 manager.build_service_plist = original_build
             self.assertTrue(Path(result['plist_path']).exists())
             self.assertEqual(calls[1][0:2], ['launchctl', 'bootstrap'])
+
+    def test_start_service_tolerates_kickstart_race_when_service_is_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ServerManager(tmpdir)
+            plist_path = Path(tmpdir) / f'{DEFAULT_SERVICE_LABEL}.plist'
+            plist_path.write_text('plist', encoding='utf-8')
+            calls = []
+            original_run = manager.run_command
+            original_status = manager.service_status
+
+            def fake_run(cmd, check=True):
+                calls.append((cmd, check))
+                if cmd[:2] == ['launchctl', 'kickstart']:
+                    return type('R', (), {'returncode': 37, 'stdout': '', 'stderr': 'service already starting'})()
+                return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+
+            manager.run_command = fake_run
+            manager.service_status = lambda label=DEFAULT_SERVICE_LABEL, check_platform=True: {
+                'ok': True,
+                'label': label,
+                'target': f'gui/123/{label}',
+                'stdout': 'state = running\npid = 1',
+                'stderr': '',
+            }
+            try:
+                result = manager.start_service(label=DEFAULT_SERVICE_LABEL, launch_agents_dir=tmpdir)
+            finally:
+                manager.run_command = original_run
+                manager.service_status = original_status
+
+            self.assertTrue(result['ok'])
+            self.assertEqual(calls[0][0][0:2], ['launchctl', 'bootstrap'])
+            self.assertEqual(calls[1][0][0:2], ['launchctl', 'kickstart'])
+
+    def test_restart_service_stops_then_starts(self) -> None:
+        manager = ServerManager(tempfile.mkdtemp())
+        calls = []
+        original_stop = manager.stop_service
+        original_start = manager.start_service
+        manager.stop_service = lambda label=DEFAULT_SERVICE_LABEL: calls.append(('stop', label)) or {'ok': True}
+        manager.start_service = lambda label=DEFAULT_SERVICE_LABEL, launch_agents_dir=None: calls.append(('start', label, launch_agents_dir)) or {'ok': True, 'label': label}
+        try:
+            result = manager.restart_service(label=DEFAULT_SERVICE_LABEL, launch_agents_dir='/tmp/agents')
+        finally:
+            manager.stop_service = original_stop
+            manager.start_service = original_start
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(calls[0], ('stop', DEFAULT_SERVICE_LABEL))
+        self.assertEqual(calls[1], ('start', DEFAULT_SERVICE_LABEL, '/tmp/agents'))

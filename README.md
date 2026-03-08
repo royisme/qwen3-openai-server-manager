@@ -187,12 +187,17 @@ The compatibility layer currently supports:
 
 - plain string `input`
 - message-list `input`
+- `enable_thinking: false`
+- `no_thinking: true`
+- `reasoning: {"enabled": false}` and `reasoning: {"effort": "minimal"}` as practical aliases
 - `store: true`
 - `previous_response_id` for follow-up turns
 - local disk-backed response persistence for stored responses
 - `GET /v1/responses/{response_id}` for retrieving stored responses
 - `DELETE /v1/responses/{response_id}` for deleting stored responses
 - OpenAI-style `error` objects for `/v1/*` failures
+
+By default, not passing a thinking-related flag does not disable reasoning. If you want concise final-only output, pass one of the explicit disable flags above.
 
 Example:
 
@@ -206,6 +211,22 @@ curl -X POST "http://127.0.0.1:8288/v1/responses" \
     "temperature": 0
   }'
 ```
+
+No-thinking example:
+
+```bash
+curl -X POST "http://127.0.0.1:8288/v1/responses" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model": "z-lab/Qwen3.5-4B-PARO",
+    "input": "Reply with exactly: OK",
+    "max_output_tokens": 32,
+    "temperature": 0,
+    "no_thinking": true
+  }'
+```
+
+The same behavior also works on `POST /v1/chat/completions` with either `enable_thinking: false` or `no_thinking: true`.
 
 ## OpenAI-Compatible Image Request Example
 
