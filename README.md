@@ -15,6 +15,16 @@ This repository is a **secondary development / engineering-completion wrapper** 
 
 In short: upstream provides the core inference stack, while this repository turns it into a more complete local service workflow.
 
+## Highlights
+
+- OpenAI-compatible local API for `z-lab/Qwen3.5-4B-PARO`
+- Works well as a free local provider for agent runtimes and tools
+- Apple Silicon friendly with automatic `mlx` routing
+- Supports image understanding in the local serving path
+- Includes process lifecycle management, health checks, logs, and config-driven startup
+- Supports persistent macOS background service management via `launchd`
+- Designed as a practical companion layer for privacy-aware and cost-aware AI workflows
+
 ## What This Project Adds
 
 Compared with the raw upstream serving flow, this project adds:
