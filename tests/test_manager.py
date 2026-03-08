@@ -127,6 +127,40 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(status['pid'], 4321)
             self.assertEqual(status['config']['port'], 8288)
 
+            self.assertTrue(status['ready'])
+            self.assertEqual(status['lifecycle_state'], 'running')
+
+    def test_status_reports_starting_when_launchd_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ServerManager(tmpdir)
+            original_launchd_runtime_config = manager.launchd_runtime_config
+            original_service_status = manager.service_status
+            original_health = manager.health
+            manager.launchd_runtime_config = lambda label=DEFAULT_SERVICE_LABEL, launch_agents_dir=None: {
+                'label': DEFAULT_SERVICE_LABEL,
+                'plist_path': str(Path(tmpdir) / f'{DEFAULT_SERVICE_LABEL}.plist'),
+                'working_directory': tmpdir,
+                'command': ['python3', '-m', 'qwen3_server_manager.paro_serve'],
+                'config': {'model': 'demo', 'host': '127.0.0.1', 'port': 8288, 'backend': 'mlx'},
+            }
+            manager.service_status = lambda label=DEFAULT_SERVICE_LABEL, check_platform=True: {
+                'ok': True,
+                'label': DEFAULT_SERVICE_LABEL,
+                'target': f'gui/123/{DEFAULT_SERVICE_LABEL}',
+                'stdout': 'state = running\npid = 4321',
+                'stderr': '',
+            }
+            manager.health = lambda host, port, timeout=2.0: {'ok': False, 'error': 'connection refused'}
+            try:
+                status = manager.status()
+            finally:
+                manager.launchd_runtime_config = original_launchd_runtime_config
+                manager.service_status = original_service_status
+                manager.health = original_health
+            self.assertTrue(status['running'])
+            self.assertFalse(status['ready'])
+            self.assertEqual(status['lifecycle_state'], 'starting')
+
     def test_build_service_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ServerManager(tmpdir)

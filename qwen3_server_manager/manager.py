@@ -296,6 +296,8 @@ class ServerManager:
             health = self.health(state.config['host'], int(state.config['port'])) if running else None
             return {
                 'running': running,
+                'ready': bool(health.get('ok')) if health else False,
+                'lifecycle_state': 'running' if running and health and health.get('ok') else 'starting' if running else 'stopped',
                 'mode': 'direct',
                 'pid': state.pid,
                 'started_at': state.started_at,
@@ -315,8 +317,13 @@ class ServerManager:
                 config = runtime.get('config', {})
                 host = config.get('host', '127.0.0.1')
                 port = int(config.get('port', 8000))
+                health = self.health(host, port)
+                running = state_raw == 'running'
+                lifecycle_state = 'running' if running and health.get('ok') else 'starting' if running else state_raw
                 return {
-                    'running': state_raw == 'running',
+                    'running': running,
+                    'ready': bool(health.get('ok')),
+                    'lifecycle_state': lifecycle_state,
                     'mode': 'launchd',
                     'reason': 'no state file; using launchd status',
                     'pid': int(pid_raw) if pid_raw and pid_raw.isdigit() else None,
@@ -328,7 +335,7 @@ class ServerManager:
                     },
                     'command': runtime.get('command'),
                     'config': config,
-                    'health': self.health(host, port),
+                    'health': health,
                 }
 
         return {'running': False, 'reason': 'no state file'}
