@@ -6,7 +6,11 @@ from qwen3_server_manager.paro_serve import (
     CallableTokenizerProxy,
     CompatibleQwenVLMProcessor,
     _RESPONSE_STORE,
+    _delete_response,
     _normalize_responses_input,
+    _response_store_path,
+    _save_response_store,
+    _load_response_store,
     _stored_messages_from_response,
 )
 
@@ -99,3 +103,29 @@ class ResponsesCompatTests(unittest.TestCase):
             _RESPONSE_STORE.pop('resp_test', None)
         self.assertEqual(messages[0]['content'], 'Hi')
         self.assertEqual(messages[1]['content'], 'Hello')
+
+
+class ResponseStoreTests(unittest.TestCase):
+    def test_delete_response_removes_entry(self) -> None:
+        _RESPONSE_STORE['resp_delete'] = {'messages': []}
+        self.assertTrue(_delete_response('resp_delete'))
+        self.assertNotIn('resp_delete', _RESPONSE_STORE)
+
+    def test_response_store_persists_to_disk(self) -> None:
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old = os.environ.get('QWEN3_RUNTIME_DIR')
+            os.environ['QWEN3_RUNTIME_DIR'] = tmpdir
+            _RESPONSE_STORE.clear()
+            _RESPONSE_STORE['resp_disk'] = {'response': {'id': 'resp_disk'}, 'messages': [], 'created_at': 1}
+            _save_response_store()
+            _RESPONSE_STORE.clear()
+            _load_response_store()
+            try:
+                self.assertIn('resp_disk', _RESPONSE_STORE)
+                self.assertTrue(_response_store_path().exists())
+            finally:
+                if old is None:
+                    os.environ.pop('QWEN3_RUNTIME_DIR', None)
+                else:
+                    os.environ['QWEN3_RUNTIME_DIR'] = old

@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 
 def _resolve_model_dir(model_path: str) -> Path:
@@ -168,6 +169,45 @@ def _serve_mlx_text():
 _RESPONSE_STORE: dict[str, dict] = {}
 
 
+def _response_store_path() -> Path:
+    runtime_dir = Path(os.environ.get('QWEN3_RUNTIME_DIR', '.runtime/qwen3-server-manager'))
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir / 'responses_store.json'
+
+
+def _load_response_store() -> None:
+    path = _response_store_path()
+    if not path.exists():
+        return
+    try:
+        loaded = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        loaded = {}
+    _RESPONSE_STORE.clear()
+    _RESPONSE_STORE.update(loaded)
+
+
+def _save_response_store() -> None:
+    path = _response_store_path()
+    path.write_text(json.dumps(_RESPONSE_STORE, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def _store_response(response_id: str, response: dict[str, Any], messages: list[dict], created_at: int) -> None:
+    _RESPONSE_STORE[response_id] = {
+        'response': response,
+        'messages': messages,
+        'created_at': created_at,
+    }
+    _save_response_store()
+
+
+def _delete_response(response_id: str) -> bool:
+    removed = _RESPONSE_STORE.pop(response_id, None) is not None
+    if removed:
+        _save_response_store()
+    return removed
+
+
 def _normalize_role(role: str | None) -> str:
     if role in {'system', 'developer'}:
         return 'system'
@@ -263,6 +303,30 @@ def _patch_responses_routes(server_module) -> None:
     from fastapi.responses import JSONResponse, StreamingResponse
 
     app = server_module.app
+    _load_response_store()
+    if not getattr(app.state, 'qwen3_openai_error_handlers_installed', False):
+        from fastapi.responses import JSONResponse
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+
+        @app.exception_handler(StarletteHTTPException)
+        async def openai_http_exception_handler(request, exc):
+            if request.url.path.startswith('/v1/') or request.url.path.startswith('/responses'):
+                detail = exc.detail
+                message = detail.get('message') if isinstance(detail, dict) else str(detail)
+                code = detail.get('code') if isinstance(detail, dict) else None
+                param = detail.get('param') if isinstance(detail, dict) else None
+                err_type = detail.get('type') if isinstance(detail, dict) else 'invalid_request_error'
+                return JSONResponse(status_code=exc.status_code, content={'error': {'message': message, 'type': err_type, 'param': param, 'code': code}})
+            raise exc
+
+        @app.exception_handler(Exception)
+        async def openai_exception_handler(request, exc):
+            if request.url.path.startswith('/v1/') or request.url.path.startswith('/responses'):
+                return JSONResponse(status_code=500, content={'error': {'message': str(exc), 'type': 'server_error', 'param': None, 'code': None}})
+            raise exc
+
+        app.state.qwen3_openai_error_handlers_installed = True
+
     app.router.routes = [
         route
         for route in app.router.routes
@@ -274,7 +338,7 @@ def _patch_responses_routes(server_module) -> None:
     async def patched_responses_endpoint(body: dict = Body(...)):
         model_name = body.get('model')
         if not model_name:
-            raise HTTPException(status_code=400, detail='model is required')
+            raise HTTPException(status_code=400, detail={'message': 'model is required', 'type': 'invalid_request_error', 'param': 'model', 'code': None})
 
         previous_response_id = body.get('previous_response_id')
         store = body.get('store', True)
@@ -288,15 +352,15 @@ def _patch_responses_routes(server_module) -> None:
             model, processor, config = server_module.get_cached_model(model_name)
             current_messages, images = _normalize_responses_input(body.get('input'))
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"previous_response_id not found: {previous_response_id}")
+            raise HTTPException(status_code=404, detail={'message': f'previous_response_id not found: {previous_response_id}', 'type': 'not_found_error', 'param': 'previous_response_id', 'code': None})
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail={'message': str(exc), 'type': 'invalid_request_error', 'param': 'input', 'code': None})
 
         if previous_response_id:
             try:
                 prior_messages = _stored_messages_from_response(previous_response_id)
             except KeyError:
-                raise HTTPException(status_code=404, detail=f'previous_response_id not found: {previous_response_id}')
+                raise HTTPException(status_code=404, detail={'message': f'previous_response_id not found: {previous_response_id}', 'type': 'not_found_error', 'param': 'previous_response_id', 'code': None})
         else:
             prior_messages = []
 
@@ -382,11 +446,7 @@ def _patch_responses_routes(server_module) -> None:
                     completed = dict(base_response)
                     completed.update({'status': 'completed', 'output': [final_item], 'output_text': full_text, 'usage': usage})
                     if store:
-                        _RESPONSE_STORE[response_id] = {
-                            'response': completed,
-                            'messages': chat_messages + [{'role': 'assistant', 'content': full_text}],
-                            'created_at': generated_at,
-                        }
+                        _store_response(response_id, completed, chat_messages + [{'role': 'assistant', 'content': full_text}], generated_at)
                     yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': full_text}, ensure_ascii=False)}\n\n"
                     yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_part}, ensure_ascii=False)}\n\n"
                     yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': final_item}, ensure_ascii=False)}\n\n"
@@ -394,7 +454,7 @@ def _patch_responses_routes(server_module) -> None:
                 except HTTPException:
                     raise
                 except Exception as exc:
-                    raise HTTPException(status_code=500, detail=f'Generation failed: {exc}')
+                    raise HTTPException(status_code=500, detail={'message': f'Generation failed: {exc}', 'type': 'server_error', 'param': None, 'code': None})
                 finally:
                     server_module.mx.clear_cache()
                     server_module.gc.collect()
@@ -444,11 +504,7 @@ def _patch_responses_routes(server_module) -> None:
                 'user': body.get('user'),
             }
             if store:
-                _RESPONSE_STORE[response_id] = {
-                    'response': response,
-                    'messages': chat_messages + [{'role': 'assistant', 'content': result.text}],
-                    'created_at': generated_at,
-                }
+                _store_response(response_id, response, chat_messages + [{'role': 'assistant', 'content': result.text}], generated_at)
             server_module.mx.clear_cache()
             server_module.gc.collect()
             return JSONResponse(response)
@@ -457,15 +513,22 @@ def _patch_responses_routes(server_module) -> None:
         except Exception as exc:
             server_module.mx.clear_cache()
             server_module.gc.collect()
-            raise HTTPException(status_code=500, detail=f'Generation failed: {exc}')
+            raise HTTPException(status_code=500, detail={'message': f'Generation failed: {exc}', 'type': 'server_error', 'param': None, 'code': None})
 
     @app.get('/responses/{response_id}')
     @app.get('/v1/responses/{response_id}', include_in_schema=False)
     async def patched_get_response(response_id: str):
         stored = _RESPONSE_STORE.get(response_id)
         if not stored:
-            raise HTTPException(status_code=404, detail=f'response not found: {response_id}')
+            raise HTTPException(status_code=404, detail={'message': f'response not found: {response_id}', 'type': 'not_found_error', 'param': 'response_id', 'code': None})
         return JSONResponse(stored['response'])
+
+    @app.delete('/responses/{response_id}')
+    @app.delete('/v1/responses/{response_id}', include_in_schema=False)
+    async def patched_delete_response(response_id: str):
+        if not _delete_response(response_id):
+            raise HTTPException(status_code=404, detail={'message': f'response not found: {response_id}', 'type': 'not_found_error', 'param': 'response_id', 'code': None})
+        return JSONResponse({'id': response_id, 'object': 'response', 'deleted': True})
 
 
 def _serve_mlx_vlm():

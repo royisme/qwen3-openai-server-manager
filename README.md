@@ -189,7 +189,10 @@ The compatibility layer currently supports:
 - message-list `input`
 - `store: true`
 - `previous_response_id` for follow-up turns
+- local disk-backed response persistence for stored responses
 - `GET /v1/responses/{response_id}` for retrieving stored responses
+- `DELETE /v1/responses/{response_id}` for deleting stored responses
+- OpenAI-style `error` objects for `/v1/*` failures
 
 Example:
 
