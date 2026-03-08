@@ -120,6 +120,14 @@ By default, it reads `config/config.json`.
 uv run qwen3-server-manager status
 ```
 
+The status output includes lifecycle-oriented fields such as:
+
+- `mode`: whether the server is running as a direct process or through `launchd`
+- `lifecycle_state`: typically `starting`, `running`, or `stopped`
+- `ready`: whether the health check is already passing
+
+This is especially useful in service mode, where `launchd` may have already started the process while the model is still warming up.
+
 ### 4. Check logs
 
 ```bash
@@ -275,6 +283,14 @@ uv run qwen3-server-manager start
 uv run qwen3-server-manager status
 uv run qwen3-server-manager logs --tail 80
 ```
+
+`status` 现在会补充更适合服务场景的状态字段：
+
+- `mode`：直接进程或 `launchd` 服务模式
+- `lifecycle_state`：通常是 `starting`、`running` 或 `stopped`
+- `ready`：健康检查是否已经通过
+
+这样在 `launchd` 刚拉起、模型还在加载时，就不会误以为服务已经完全 ready。
 
 ## 默认配置
 
