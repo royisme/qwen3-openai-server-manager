@@ -44,6 +44,7 @@ The following capabilities have been verified locally on **Apple Silicon + MLX**
 
 - OpenAI-compatible text generation works
 - OpenAI-style tool calling works
+- OpenAI-compatible `responses` API works
 - Image input via `image_url` works
 - Local service management commands work
 - `launchd` service mode works
@@ -177,6 +178,23 @@ uv run qwen3-server-manager start
 ```
 
 CLI flags override config values.
+
+## OpenAI-Compatible Responses API
+
+This project also works with OpenAI-style `responses` requests, which is useful if you are migrating from Chat Completions to the newer Responses API shape.
+
+Example:
+
+```bash
+curl -X POST "http://127.0.0.1:8288/v1/responses" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model": "z-lab/Qwen3.5-4B-PARO",
+    "input": "Say hello in one short sentence.",
+    "max_output_tokens": 32,
+    "temperature": 0
+  }'
+```
 
 ## OpenAI-Compatible Image Request Example
 

@@ -53,21 +53,33 @@ class ImageProcessorProxy:
         return getattr(self._image_processor, name)
 
 
+class CallableTokenizerProxy:
+    def __init__(self, tokenizer_wrapper):
+        self._wrapper = tokenizer_wrapper
+        self._tokenizer = tokenizer_wrapper._tokenizer
+
+    def __call__(self, *args, **kwargs):
+        return self._tokenizer(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapper, name)
+
+
 class CompatibleQwenVLMProcessor:
     def __init__(self, tokenizer_wrapper, image_processor):
         from mlx_vlm.utils import StoppingCriteria
 
-        self.tokenizer = tokenizer_wrapper
-        self.detokenizer = tokenizer_wrapper.detokenizer
+        self.tokenizer = CallableTokenizerProxy(tokenizer_wrapper)
+        self.detokenizer = self.tokenizer.detokenizer
         self.image_processor = ImageProcessorProxy(image_processor)
-        self.image_token = getattr(tokenizer_wrapper, 'image_token', '<|image_pad|>')
-        self.image_token_id = getattr(tokenizer_wrapper, 'image_token_id', None) or tokenizer_wrapper.convert_tokens_to_ids(
+        self.image_token = getattr(self.tokenizer, 'image_token', '<|image_pad|>')
+        self.image_token_id = getattr(self.tokenizer, 'image_token_id', None) or self.tokenizer.convert_tokens_to_ids(
             self.image_token
         )
         self.stopping_criteria = StoppingCriteria(
-            getattr(tokenizer_wrapper, 'eos_token_id', None), tokenizer=tokenizer_wrapper._tokenizer
+            getattr(self.tokenizer, 'eos_token_id', None), tokenizer=self.tokenizer._tokenizer
         )
-        tokenizer_wrapper.stopping_criteria = self.stopping_criteria
+        self.tokenizer.stopping_criteria = self.stopping_criteria
 
     def __call__(self, text, **kwargs):
         return self.tokenizer._tokenizer(text, add_special_tokens=False, **kwargs)
