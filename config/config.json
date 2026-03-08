@@ -1,0 +1,7 @@
+{
+  "model": "z-lab/Qwen3.5-4B-PARO",
+  "host": "127.0.0.1",
+  "port": 8288,
+  "backend": "mlx",
+  "extra_args": []
+}
