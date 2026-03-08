@@ -90,6 +90,43 @@ class ManagerTests(unittest.TestCase):
                 self.assertTrue(manager.stop(timeout=2.0))
                 self.assertFalse(manager.load_state())
 
+
+    def test_status_falls_back_to_launchd_when_no_state_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = ServerManager(tmpdir)
+            plist_path = Path(tmpdir) / f'{DEFAULT_SERVICE_LABEL}.plist'
+            plist_path.write_bytes(b'')
+            original_launchd_runtime_config = manager.launchd_runtime_config
+            original_service_status = manager.service_status
+            original_health = manager.health
+            original_from_sources = ServerConfig.from_sources
+            manager.launchd_runtime_config = lambda label=DEFAULT_SERVICE_LABEL, launch_agents_dir=None: {
+                'label': DEFAULT_SERVICE_LABEL,
+                'plist_path': str(plist_path),
+                'working_directory': tmpdir,
+                'command': ['python3', '-m', 'qwen3_server_manager.paro_serve'],
+                'config': {'model': 'demo', 'host': '127.0.0.1', 'port': 8288, 'backend': 'mlx'},
+            }
+            manager.service_status = lambda label=DEFAULT_SERVICE_LABEL, check_platform=True: {
+                'ok': True,
+                'label': DEFAULT_SERVICE_LABEL,
+                'target': f'gui/123/{DEFAULT_SERVICE_LABEL}',
+                'stdout': 'state = running\npid = 4321',
+                'stderr': '',
+            }
+            manager.health = lambda host, port, timeout=2.0: {'ok': True, 'url': f'http://{host}:{port}/health'}
+            try:
+                status = manager.status()
+            finally:
+                manager.launchd_runtime_config = original_launchd_runtime_config
+                manager.service_status = original_service_status
+                manager.health = original_health
+                ServerConfig.from_sources = original_from_sources
+            self.assertTrue(status['running'])
+            self.assertEqual(status['mode'], 'launchd')
+            self.assertEqual(status['pid'], 4321)
+            self.assertEqual(status['config']['port'], 8288)
+
     def test_build_service_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ServerManager(tmpdir)

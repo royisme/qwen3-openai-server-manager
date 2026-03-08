@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import plistlib
 import shutil
 import signal
@@ -263,21 +264,74 @@ class ServerManager:
         self.clear_state()
         return True
 
+    def _extract_launchd_value(self, output: str, key: str) -> str | None:
+        pattern = rf'^\s*{re.escape(key)}\s*=\s*(.+)$'
+        match = re.search(pattern, output, flags=re.MULTILINE)
+        return match.group(1).strip() if match else None
+
+    def launchd_runtime_config(self, label: str = DEFAULT_SERVICE_LABEL, launch_agents_dir: str | None = None) -> dict[str, Any] | None:
+        plist_path = self.service_plist_path(label, launch_agents_dir)
+        if not plist_path.exists():
+            return None
+        try:
+            plist = plistlib.loads(plist_path.read_bytes())
+        except Exception:
+            return None
+        arguments = plist.get('ProgramArguments', [])
+        config = ServerConfig.from_sources(str(DEFAULT_CONFIG_PATH), {}) if DEFAULT_CONFIG_PATH.exists() else None
+        result: dict[str, Any] = {
+            'label': label,
+            'plist_path': str(plist_path),
+            'working_directory': plist.get('WorkingDirectory'),
+            'command': arguments,
+        }
+        if config is not None:
+            result['config'] = asdict(config)
+        return result
+
     def status(self) -> dict[str, Any]:
         state = self.load_state()
-        if not state:
-            return {'running': False, 'reason': 'no state file'}
-        running = self.is_running(state.pid)
-        health = self.health(state.config['host'], int(state.config['port'])) if running else None
-        return {
-            'running': running,
-            'pid': state.pid,
-            'started_at': state.started_at,
-            'command': state.command,
-            'log_path': state.log_path,
-            'config': state.config,
-            'health': health,
-        }
+        if state:
+            running = self.is_running(state.pid)
+            health = self.health(state.config['host'], int(state.config['port'])) if running else None
+            return {
+                'running': running,
+                'mode': 'direct',
+                'pid': state.pid,
+                'started_at': state.started_at,
+                'command': state.command,
+                'log_path': state.log_path,
+                'config': state.config,
+                'health': health,
+            }
+
+        if platform.system() == 'Darwin':
+            service = self.service_status(check_platform=False)
+            if service.get('ok'):
+                stdout = service.get('stdout', '')
+                pid_raw = self._extract_launchd_value(stdout, 'pid')
+                state_raw = self._extract_launchd_value(stdout, 'state')
+                runtime = self.launchd_runtime_config(label=service['label']) or {}
+                config = runtime.get('config', {})
+                host = config.get('host', '127.0.0.1')
+                port = int(config.get('port', 8000))
+                return {
+                    'running': state_raw == 'running',
+                    'mode': 'launchd',
+                    'reason': 'no state file; using launchd status',
+                    'pid': int(pid_raw) if pid_raw and pid_raw.isdigit() else None,
+                    'service': {
+                        'label': service['label'],
+                        'target': service['target'],
+                        'state': state_raw,
+                        'plist_path': runtime.get('plist_path'),
+                    },
+                    'command': runtime.get('command'),
+                    'config': config,
+                    'health': self.health(host, port),
+                }
+
+        return {'running': False, 'reason': 'no state file'}
 
     def health(self, host: str, port: int, timeout: float = 2.0) -> dict[str, Any]:
         base = f'http://{host}:{port}'
@@ -391,8 +445,8 @@ class ServerManager:
         self.stop_service(label)
         return self.start_service(label, launch_agents_dir)
 
-    def service_status(self, label: str = DEFAULT_SERVICE_LABEL) -> dict[str, Any]:
-        if platform.system() != 'Darwin':
+    def service_status(self, label: str = DEFAULT_SERVICE_LABEL, check_platform: bool = True) -> dict[str, Any]:
+        if check_platform and platform.system() != 'Darwin':
             raise RuntimeError('launchd service management is only supported on macOS')
         result = self.run_command(['launchctl', 'print', self.service_target(label)], check=False)
         return {
