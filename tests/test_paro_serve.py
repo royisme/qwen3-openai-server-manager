@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from qwen3_server_manager.paro_serve import CallableTokenizerProxy, CompatibleQwenVLMProcessor
+from qwen3_server_manager.paro_serve import (
+    CallableTokenizerProxy,
+    CompatibleQwenVLMProcessor,
+    _RESPONSE_STORE,
+    _normalize_responses_input,
+    _stored_messages_from_response,
+)
 
 
 class _FakeImageProcessor:
@@ -52,3 +58,44 @@ class TokenizerProxyTests(unittest.TestCase):
         self.assertEqual(result['text'], 'hello')
         self.assertEqual(result['kwargs']['add_special_tokens'], False)
         self.assertIsNotNone(proxy.detokenizer)
+
+
+class ResponsesCompatTests(unittest.TestCase):
+    def test_normalize_responses_input_supports_text_and_image(self) -> None:
+        messages, images = _normalize_responses_input([
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'input_text', 'text': 'Describe this image.'},
+                    {'type': 'input_image', 'image_url': 'https://example.com/a.png'},
+                ],
+            }
+        ])
+        self.assertEqual(messages, [{'role': 'user', 'content': 'Describe this image.'}])
+        self.assertEqual(images, ['https://example.com/a.png'])
+
+    def test_normalize_responses_input_supports_output_text_history(self) -> None:
+        messages, images = _normalize_responses_input([
+            {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'output_text', 'text': 'Previous answer.'},
+                ],
+            }
+        ])
+        self.assertEqual(messages, [{'role': 'assistant', 'content': 'Previous answer.'}])
+        self.assertEqual(images, [])
+
+    def test_stored_messages_from_response_round_trip(self) -> None:
+        _RESPONSE_STORE['resp_test'] = {
+            'messages': [
+                {'role': 'user', 'content': 'Hi'},
+                {'role': 'assistant', 'content': 'Hello'},
+            ]
+        }
+        try:
+            messages = _stored_messages_from_response('resp_test')
+        finally:
+            _RESPONSE_STORE.pop('resp_test', None)
+        self.assertEqual(messages[0]['content'], 'Hi')
+        self.assertEqual(messages[1]['content'], 'Hello')

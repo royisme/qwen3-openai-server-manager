@@ -183,6 +183,14 @@ CLI flags override config values.
 
 This project also works with OpenAI-style `responses` requests, which is useful if you are migrating from Chat Completions to the newer Responses API shape.
 
+The compatibility layer currently supports:
+
+- plain string `input`
+- message-list `input`
+- `store: true`
+- `previous_response_id` for follow-up turns
+- `GET /v1/responses/{response_id}` for retrieving stored responses
+
 Example:
 
 ```bash

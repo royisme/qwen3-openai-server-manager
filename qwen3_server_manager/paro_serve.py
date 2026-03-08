@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
+import time
+import uuid
 from pathlib import Path
 
 
@@ -162,6 +165,309 @@ def _serve_mlx_text():
     _upstream_serve_mlx()
 
 
+_RESPONSE_STORE: dict[str, dict] = {}
+
+
+def _normalize_role(role: str | None) -> str:
+    if role in {'system', 'developer'}:
+        return 'system'
+    if role in {'assistant', 'tool'}:
+        return role
+    return 'user'
+
+
+def _extract_image_url(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get('url') or value.get('image_url')
+    return None
+
+
+def _normalize_responses_input(input_value):
+    messages: list[dict] = []
+    images: list[str] = []
+
+    if input_value is None:
+        return messages, images
+
+    if isinstance(input_value, str):
+        return [{'role': 'user', 'content': input_value}], []
+
+    if not isinstance(input_value, list):
+        raise ValueError('input must be a string or a list of messages')
+
+    for item in input_value:
+        if isinstance(item, str):
+            messages.append({'role': 'user', 'content': item})
+            continue
+        if not isinstance(item, dict):
+            raise ValueError('each input item must be a string or message object')
+
+        role = _normalize_role(item.get('role'))
+        content = item.get('content')
+        if content is None:
+            messages.append({'role': role, 'content': ''})
+            continue
+        if isinstance(content, str):
+            messages.append({'role': role, 'content': content})
+            continue
+
+        if not isinstance(content, list):
+            raise ValueError('message content must be a string or a list')
+
+        text_parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get('type')
+            if part_type in {'input_text', 'text', 'output_text'}:
+                value = part.get('text') or part.get('content') or ''
+                if value:
+                    text_parts.append(value)
+            elif part_type in {'input_image', 'image_url'}:
+                image_url = _extract_image_url(part.get('image_url', part))
+                if image_url:
+                    images.append(image_url)
+
+        messages.append({'role': role, 'content': ' '.join(text_parts).strip()})
+
+    return messages, images
+
+
+def _assistant_output_message(text: str, message_id: str) -> dict:
+    return {
+        'id': message_id,
+        'type': 'message',
+        'status': 'completed',
+        'role': 'assistant',
+        'content': [
+            {
+                'type': 'output_text',
+                'text': text,
+                'annotations': [],
+            }
+        ],
+    }
+
+
+def _stored_messages_from_response(response_id: str) -> list[dict]:
+    stored = _RESPONSE_STORE.get(response_id)
+    if not stored:
+        raise KeyError(response_id)
+    return [dict(message) for message in stored.get('messages', [])]
+
+
+def _patch_responses_routes(server_module) -> None:
+    from fastapi import Body, HTTPException
+    from fastapi.responses import JSONResponse, StreamingResponse
+
+    app = server_module.app
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if getattr(route, 'path', None) not in {'/responses', '/v1/responses', '/responses/{response_id}', '/v1/responses/{response_id}'}
+    ]
+
+    @app.post('/responses')
+    @app.post('/v1/responses', include_in_schema=False)
+    async def patched_responses_endpoint(body: dict = Body(...)):
+        model_name = body.get('model')
+        if not model_name:
+            raise HTTPException(status_code=400, detail='model is required')
+
+        previous_response_id = body.get('previous_response_id')
+        store = body.get('store', True)
+        instructions = body.get('instructions')
+        stream = bool(body.get('stream', False))
+        max_output_tokens = int(body.get('max_output_tokens', server_module.DEFAULT_MAX_TOKENS))
+        temperature = float(body.get('temperature', server_module.DEFAULT_TEMPERATURE))
+        top_p = float(body.get('top_p', server_module.DEFAULT_TOP_P))
+
+        try:
+            model, processor, config = server_module.get_cached_model(model_name)
+            current_messages, images = _normalize_responses_input(body.get('input'))
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"previous_response_id not found: {previous_response_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        if previous_response_id:
+            try:
+                prior_messages = _stored_messages_from_response(previous_response_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail=f'previous_response_id not found: {previous_response_id}')
+        else:
+            prior_messages = []
+
+        chat_messages = prior_messages + current_messages
+        if instructions:
+            chat_messages = [{'role': 'system', 'content': instructions}] + chat_messages
+
+        template_kwargs = {
+            key: value
+            for key, value in body.items()
+            if key in server_module.ALLOWED_TEMPLATE_KWARGS
+        }
+        formatted_prompt = server_module.apply_chat_template(
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **template_kwargs,
+        )
+
+        kwargs = dict(template_kwargs)
+        generated_at = int(time.time())
+        response_id = f"resp_{uuid.uuid4().hex}"
+        message_id = f"msg_{uuid.uuid4().hex}"
+
+        if stream:
+            async def stream_generator():
+                full_text = ''
+                usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
+                base_response = {
+                    'id': response_id,
+                    'object': 'response',
+                    'created_at': generated_at,
+                    'status': 'in_progress',
+                    'error': None,
+                    'instructions': instructions,
+                    'max_output_tokens': max_output_tokens,
+                    'model': model_name,
+                    'output': [],
+                    'output_text': '',
+                    'temperature': temperature,
+                    'top_p': top_p,
+                    'truncation': 'disabled',
+                    'usage': usage,
+                    'user': body.get('user'),
+                }
+                yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': base_response}, ensure_ascii=False)}\n\n"
+                yield f"event: response.in_progress\ndata: {json.dumps({'type': 'response.in_progress', 'response': base_response}, ensure_ascii=False)}\n\n"
+                item = {'id': message_id, 'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []}
+                yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': item}, ensure_ascii=False)}\n\n"
+                part = {'type': 'output_text', 'text': '', 'annotations': []}
+                yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': part}, ensure_ascii=False)}\n\n"
+
+                try:
+                    token_iterator = server_module.stream_generate(
+                        model=model,
+                        processor=processor,
+                        prompt=formatted_prompt,
+                        image=images,
+                        temperature=temperature,
+                        max_tokens=max_output_tokens,
+                        top_p=top_p,
+                        prefill_step_size=server_module.get_prefill_step_size(),
+                        kv_bits=server_module.get_quantized_kv_bits(model_name),
+                        kv_group_size=server_module.get_kv_group_size(),
+                        max_kv_size=server_module.get_max_kv_size(model_name),
+                        quantized_kv_start=server_module.get_quantized_kv_start(),
+                        **kwargs,
+                    )
+                    for chunk in token_iterator:
+                        if chunk is None or not hasattr(chunk, 'text'):
+                            continue
+                        full_text += chunk.text
+                        usage = {
+                            'input_tokens': chunk.prompt_tokens,
+                            'output_tokens': chunk.generation_tokens,
+                            'total_tokens': chunk.total_tokens,
+                        }
+                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': chunk.text}, ensure_ascii=False)}\n\n"
+
+                    final_part = {'type': 'output_text', 'text': full_text, 'annotations': []}
+                    final_item = {'id': message_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [final_part]}
+                    completed = dict(base_response)
+                    completed.update({'status': 'completed', 'output': [final_item], 'output_text': full_text, 'usage': usage})
+                    if store:
+                        _RESPONSE_STORE[response_id] = {
+                            'response': completed,
+                            'messages': chat_messages + [{'role': 'assistant', 'content': full_text}],
+                            'created_at': generated_at,
+                        }
+                    yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': full_text}, ensure_ascii=False)}\n\n"
+                    yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_part}, ensure_ascii=False)}\n\n"
+                    yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': final_item}, ensure_ascii=False)}\n\n"
+                    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f'Generation failed: {exc}')
+                finally:
+                    server_module.mx.clear_cache()
+                    server_module.gc.collect()
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+            )
+
+        try:
+            result = server_module.generate(
+                model=model,
+                processor=processor,
+                prompt=formatted_prompt,
+                image=images,
+                temperature=temperature,
+                max_tokens=max_output_tokens,
+                top_p=top_p,
+                prefill_step_size=server_module.get_prefill_step_size(),
+                kv_bits=server_module.get_quantized_kv_bits(model_name),
+                kv_group_size=server_module.get_kv_group_size(),
+                max_kv_size=server_module.get_max_kv_size(model_name),
+                quantized_kv_start=server_module.get_quantized_kv_start(),
+                verbose=False,
+                **kwargs,
+            )
+            response = {
+                'id': response_id,
+                'object': 'response',
+                'created_at': generated_at,
+                'status': 'completed',
+                'error': None,
+                'instructions': instructions,
+                'max_output_tokens': max_output_tokens,
+                'model': model_name,
+                'output': [_assistant_output_message(result.text, message_id)],
+                'output_text': result.text,
+                'temperature': temperature,
+                'top_p': top_p,
+                'truncation': 'disabled',
+                'usage': {
+                    'input_tokens': result.prompt_tokens,
+                    'output_tokens': result.generation_tokens,
+                    'total_tokens': result.total_tokens,
+                },
+                'user': body.get('user'),
+            }
+            if store:
+                _RESPONSE_STORE[response_id] = {
+                    'response': response,
+                    'messages': chat_messages + [{'role': 'assistant', 'content': result.text}],
+                    'created_at': generated_at,
+                }
+            server_module.mx.clear_cache()
+            server_module.gc.collect()
+            return JSONResponse(response)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            server_module.mx.clear_cache()
+            server_module.gc.collect()
+            raise HTTPException(status_code=500, detail=f'Generation failed: {exc}')
+
+    @app.get('/responses/{response_id}')
+    @app.get('/v1/responses/{response_id}', include_in_schema=False)
+    async def patched_get_response(response_id: str):
+        stored = _RESPONSE_STORE.get(response_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail=f'response not found: {response_id}')
+        return JSONResponse(stored['response'])
+
+
 def _serve_mlx_vlm():
     import uvicorn
     import mlx_vlm.server
@@ -204,6 +510,7 @@ def _serve_mlx_vlm():
         return model, processor
 
     mlx_vlm.server.load = _patched_load
+    _patch_responses_routes(mlx_vlm.server)
     uvicorn.run(mlx_vlm.server.app, host=args.host, port=args.port, workers=1, reload=False)
 
 
