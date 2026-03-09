@@ -7,6 +7,7 @@ from qwen3_server_manager.paro_serve import (
     CompatibleQwenVLMProcessor,
     _RESPONSE_STORE,
     _apply_reasoning_aliases,
+    _build_response_payload,
     _build_response_output_items,
     _delete_response,
     _extract_response_include,
@@ -16,6 +17,7 @@ from qwen3_server_manager.paro_serve import (
     _response_store_path,
     _save_response_store,
     _sanitize_output_text,
+    _stream_event_payload,
     _load_response_store,
     _stored_messages_from_response,
 )
@@ -213,3 +215,31 @@ class ResponsesOutputShapeTests(unittest.TestCase):
         self.assertEqual(_extract_response_include(['output[0].content[0].text']), ['output[0].content[0].text'])
         with self.assertRaises(ValueError):
             _extract_response_include('output_text')
+
+    def test_build_response_payload_includes_completed_and_input(self) -> None:
+        payload = _build_response_payload(
+            response_id='resp_1',
+            generated_at=123,
+            instructions='be concise',
+            max_output_tokens=32,
+            model_name='demo-model',
+            output_items=[{'type': 'message'}],
+            output_text='OK',
+            temperature=0,
+            top_p=1,
+            usage={'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2},
+            user='user_1',
+            metadata={'source': 'test'},
+            input_items=[{'type': 'message'}],
+        )
+        self.assertEqual(payload['id'], 'resp_1')
+        self.assertEqual(payload['input'], [{'type': 'message'}])
+        self.assertEqual(payload['metadata'], {'source': 'test'})
+        self.assertIsNotNone(payload['completed_at'])
+        self.assertIsNone(payload['incomplete_details'])
+
+    def test_stream_event_payload_adds_sequence_number(self) -> None:
+        event = _stream_event_payload('response.created', 3, response={'id': 'resp_1'})
+        self.assertEqual(event['type'], 'response.created')
+        self.assertEqual(event['sequence_number'], 3)
+        self.assertEqual(event['response']['id'], 'resp_1')

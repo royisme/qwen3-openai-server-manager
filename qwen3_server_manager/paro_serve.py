@@ -405,18 +405,61 @@ def _build_response_payload(
     usage: dict,
     user: str | None,
     metadata: dict | None = None,
+    input_items: Any = None,
 ) -> dict:
     return {
         'id': response_id,
         'object': 'response',
         'created_at': generated_at,
+        'completed_at': int(time.time()),
         'status': 'completed',
         'error': None,
+        'incomplete_details': None,
         'instructions': instructions,
+        'input': input_items if input_items is not None else [],
         'max_output_tokens': max_output_tokens,
         'model': model_name,
         'output': output_items,
         'output_text': output_text,
+        'temperature': temperature,
+        'top_p': top_p,
+        'truncation': 'disabled',
+        'usage': usage,
+        'user': user,
+        'metadata': metadata or {},
+    }
+
+
+def _stream_event_payload(event_type: str, sequence_number: int, **payload) -> dict:
+    return {'type': event_type, 'sequence_number': sequence_number, **payload}
+
+
+def _response_in_progress_payload(
+    response_id: str,
+    generated_at: int,
+    instructions: str | None,
+    max_output_tokens: int,
+    model_name: str,
+    temperature: float,
+    top_p: float,
+    usage: dict,
+    user: str | None,
+    metadata: dict | None = None,
+    input_items: Any = None,
+) -> dict:
+    return {
+        'id': response_id,
+        'object': 'response',
+        'created_at': generated_at,
+        'status': 'in_progress',
+        'error': None,
+        'incomplete_details': None,
+        'instructions': instructions,
+        'input': input_items if input_items is not None else [],
+        'max_output_tokens': max_output_tokens,
+        'model': model_name,
+        'output': [],
+        'output_text': '',
         'temperature': temperature,
         'top_p': top_p,
         'truncation': 'disabled',
@@ -591,30 +634,32 @@ def _patch_responses_routes(server_module) -> None:
             async def stream_generator():
                 full_text = ''
                 usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
-                base_response = {
-                    'id': response_id,
-                    'object': 'response',
-                    'created_at': generated_at,
-                    'status': 'in_progress',
-                    'error': None,
-                    'instructions': instructions,
-                    'max_output_tokens': max_output_tokens,
-                    'model': model_name,
-                    'output': [],
-                    'output_text': '',
-                    'temperature': temperature,
-                    'top_p': top_p,
-                    'truncation': 'disabled',
-                    'usage': usage,
-                    'user': body.get('user'),
-                    'metadata': metadata,
-                }
-                yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': base_response}, ensure_ascii=False)}\n\n"
-                yield f"event: response.in_progress\ndata: {json.dumps({'type': 'response.in_progress', 'response': base_response}, ensure_ascii=False)}\n\n"
+                sequence_number = 0
+
+                def emit(event_type: str, **payload) -> str:
+                    nonlocal sequence_number
+                    sequence_number += 1
+                    return f"event: {event_type}\ndata: {json.dumps(_stream_event_payload(event_type, sequence_number, **payload), ensure_ascii=False)}\n\n"
+
+                base_response = _response_in_progress_payload(
+                    response_id=response_id,
+                    generated_at=generated_at,
+                    instructions=instructions,
+                    max_output_tokens=max_output_tokens,
+                    model_name=model_name,
+                    temperature=temperature,
+                    top_p=top_p,
+                    usage=usage,
+                    user=body.get('user'),
+                    metadata=metadata,
+                    input_items=body.get('input'),
+                )
+                yield emit('response.created', response=base_response)
+                yield emit('response.in_progress', response=base_response)
                 item = {'id': message_id, 'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []}
-                yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': item}, ensure_ascii=False)}\n\n"
+                yield emit('response.output_item.added', output_index=0, item=item)
                 part = {'type': 'output_text', 'text': '', 'annotations': []}
-                yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': part}, ensure_ascii=False)}\n\n"
+                yield emit('response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=part)
 
                 try:
                     token_iterator = server_module.stream_generate(
@@ -642,22 +687,44 @@ def _patch_responses_routes(server_module) -> None:
                             'output_tokens': chunk.generation_tokens,
                             'total_tokens': chunk.total_tokens,
                         }
-                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': chunk.text}, ensure_ascii=False)}\n\n"
+                        yield emit('response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=chunk.text)
 
                     parsed = _parse_response_tool_result(server_module, full_text, tool_module, tools)
                     output_items, output_text = _build_response_output_items(parsed['remaining_text'], parsed['calls'], message_id)
                     final_part = {'type': 'output_text', 'text': output_text, 'annotations': []}
-                    completed = dict(base_response)
-                    completed.update({'status': 'completed', 'output': output_items, 'output_text': output_text, 'usage': usage})
+                    completed = _build_response_payload(
+                        response_id=response_id,
+                        generated_at=generated_at,
+                        instructions=instructions,
+                        max_output_tokens=max_output_tokens,
+                        model_name=model_name,
+                        output_items=output_items,
+                        output_text=output_text,
+                        temperature=temperature,
+                        top_p=top_p,
+                        usage=usage,
+                        user=body.get('user'),
+                        metadata=metadata,
+                        input_items=body.get('input'),
+                    )
                     if include:
                         completed['include'] = include
                     if store:
                         _store_response(response_id, completed, chat_messages + [{'role': 'assistant', 'content': output_text}], generated_at)
-                    yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': output_text}, ensure_ascii=False)}\n\n"
-                    yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_part}, ensure_ascii=False)}\n\n"
+                    yield emit('response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=output_text)
+                    yield emit('response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_part)
                     for output_index, item in enumerate(output_items):
-                        yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': output_index, 'item': item}, ensure_ascii=False)}\n\n"
-                    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
+                        if item.get('type') == 'function_call':
+                            yield emit('response.output_item.added', output_index=output_index, item=item)
+                            yield emit(
+                                'response.function_call_arguments.done',
+                                item_id=item['id'],
+                                output_index=output_index,
+                                name=item.get('name'),
+                                arguments=item.get('arguments', '{}'),
+                            )
+                        yield emit('response.output_item.done', output_index=output_index, item=item)
+                    yield emit('response.completed', response=completed)
                 except HTTPException:
                     raise
                 except Exception as exc:
@@ -708,6 +775,7 @@ def _patch_responses_routes(server_module) -> None:
                 },
                 user=body.get('user'),
                 metadata=metadata,
+                input_items=body.get('input'),
             )
             if include:
                 response['include'] = include

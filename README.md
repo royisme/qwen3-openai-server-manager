@@ -194,6 +194,7 @@ The compatibility layer currently supports:
 - `tools` passthrough with function-call style output items when the underlying template supports tool parsing
 - `include` passthrough for common migration flows
 - `metadata` passthrough on stored responses
+- streaming SSE events with `sequence_number` on the patched `responses` path
 - `store: true`
 - `previous_response_id` for follow-up turns
 - local disk-backed response persistence for stored responses
@@ -231,6 +232,8 @@ curl -X POST "http://127.0.0.1:8288/v1/responses" \
 ```
 
 The same behavior also works on `POST /v1/chat/completions` with either `enable_thinking: false` or `no_thinking: true`.
+
+For streaming `responses`, the patched server now emits more OpenAI-like SSE events, including `response.created`, `response.in_progress`, `response.output_text.delta`, `response.output_text.done`, `response.output_item.done`, and `response.completed`, each with a `sequence_number`.
 
 Item-style input example:
 
