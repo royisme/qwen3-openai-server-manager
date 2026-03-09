@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib
 import math
 import os
 import sys
@@ -251,6 +252,42 @@ def _sanitize_output_text(text: str) -> str:
         sanitized = sanitized.replace(token, '')
     return sanitized
 
+def _stringify_content_value(value: Any) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _normalize_response_content_parts(content, images: list[str]) -> str:
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ValueError('message content must be a string or a list')
+
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get('type')
+        if part_type in {'input_text', 'text', 'output_text'}:
+            value = part.get('text') or part.get('content') or ''
+            if value:
+                text_parts.append(value)
+        elif part_type in {'input_image', 'image_url'}:
+            image_url = _extract_image_url(part.get('image_url', part))
+            if image_url:
+                images.append(image_url)
+        elif part_type == 'function_call_output':
+            value = _stringify_content_value(part.get('output'))
+            if value:
+                text_parts.append(value)
+    return ' '.join(text_parts).strip()
+
+
 def _normalize_responses_input(input_value):
     messages: list[dict] = []
     images: list[str] = []
@@ -271,35 +308,122 @@ def _normalize_responses_input(input_value):
         if not isinstance(item, dict):
             raise ValueError('each input item must be a string or message object')
 
+        item_type = item.get('type')
+        if item_type == 'message':
+            role = _normalize_role(item.get('role'))
+            messages.append({'role': role, 'content': _normalize_response_content_parts(item.get('content'), images)})
+            continue
+        if item_type in {'input_text', 'output_text', 'text'}:
+            messages.append({'role': 'user', 'content': _stringify_content_value(item.get('text') or item.get('content'))})
+            continue
+        if item_type in {'input_image', 'image_url'}:
+            image_url = _extract_image_url(item.get('image_url', item))
+            if image_url:
+                images.append(image_url)
+            continue
+        if item_type == 'function_call_output':
+            output_value = _stringify_content_value(item.get('output'))
+            messages.append({'role': 'tool', 'content': output_value})
+            continue
+        if item_type == 'function_call':
+            call_name = item.get('name') or 'tool'
+            call_arguments = _stringify_content_value(item.get('arguments'))
+            messages.append({'role': 'assistant', 'content': f'Tool call {call_name}: {call_arguments}'.strip()})
+            continue
+
         role = _normalize_role(item.get('role'))
         content = item.get('content')
         if content is None:
             messages.append({'role': role, 'content': ''})
             continue
-        if isinstance(content, str):
-            messages.append({'role': role, 'content': content})
-            continue
-
-        if not isinstance(content, list):
-            raise ValueError('message content must be a string or a list')
-
-        text_parts: list[str] = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_type = part.get('type')
-            if part_type in {'input_text', 'text', 'output_text'}:
-                value = part.get('text') or part.get('content') or ''
-                if value:
-                    text_parts.append(value)
-            elif part_type in {'input_image', 'image_url'}:
-                image_url = _extract_image_url(part.get('image_url', part))
-                if image_url:
-                    images.append(image_url)
-
-        messages.append({'role': role, 'content': ' '.join(text_parts).strip()})
+        messages.append({'role': role, 'content': _normalize_response_content_parts(content, images)})
 
     return messages, images
+
+
+def _response_function_call_item(call: dict) -> dict:
+    function = call.get('function', {})
+    return {
+        'id': call.get('id') or f"fc_{uuid.uuid4().hex}",
+        'type': 'function_call',
+        'call_id': call.get('id') or f"call_{uuid.uuid4().hex}",
+        'name': function.get('name'),
+        'arguments': function.get('arguments', '{}'),
+        'status': 'completed',
+    }
+
+
+def _build_response_output_items(text: str, tool_calls: list[dict], message_id: str) -> tuple[list[dict], str]:
+    sanitized_text = _sanitize_output_text(text)
+    items: list[dict] = []
+    if sanitized_text.strip() or not tool_calls:
+        items.append(_assistant_output_message(sanitized_text, message_id))
+    items.extend(_response_function_call_item(call) for call in tool_calls)
+    return items, sanitized_text
+
+
+def _extract_response_include(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    raise ValueError('include must be a list of strings')
+
+
+def _resolve_response_tools(server_module, processor, tools):
+    if not tools:
+        return None, None
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+    if not hasattr(tokenizer, 'chat_template'):
+        return None, None
+    tool_parser_type = server_module._infer_tool_parser(tokenizer.chat_template)
+    if tool_parser_type is None:
+        return None, None
+    tool_module = importlib.import_module(f'mlx_lm.tool_parsers.{tool_parser_type}')
+    return tool_parser_type, tool_module
+
+
+def _parse_response_tool_result(server_module, text: str, tool_module, tools):
+    sanitized_text = _sanitize_output_text(text)
+    if tool_module is None:
+        return {'calls': [], 'remaining_text': sanitized_text}
+    parsed = server_module.process_tool_calls(model_output=sanitized_text, tool_module=tool_module, tools=tools)
+    parsed['remaining_text'] = _sanitize_output_text(parsed.get('remaining_text', ''))
+    return parsed
+
+
+def _build_response_payload(
+    response_id: str,
+    generated_at: int,
+    instructions: str | None,
+    max_output_tokens: int,
+    model_name: str,
+    output_items: list[dict],
+    output_text: str,
+    temperature: float,
+    top_p: float,
+    usage: dict,
+    user: str | None,
+    metadata: dict | None = None,
+) -> dict:
+    return {
+        'id': response_id,
+        'object': 'response',
+        'created_at': generated_at,
+        'status': 'completed',
+        'error': None,
+        'instructions': instructions,
+        'max_output_tokens': max_output_tokens,
+        'model': model_name,
+        'output': output_items,
+        'output_text': output_text,
+        'temperature': temperature,
+        'top_p': top_p,
+        'truncation': 'disabled',
+        'usage': usage,
+        'user': user,
+        'metadata': metadata or {},
+    }
 
 
 def _assistant_output_message(text: str, message_id: str) -> dict:
@@ -411,6 +535,12 @@ def _patch_responses_routes(server_module) -> None:
         store = body.get('store', True)
         instructions = body.get('instructions')
         stream = bool(body.get('stream', False))
+        try:
+            include = _extract_response_include(body.get('include'))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={'message': str(exc), 'type': 'invalid_request_error', 'param': 'include', 'code': None})
+        metadata = body.get('metadata') if isinstance(body.get('metadata'), dict) else {}
+        tools = body.get('tools') if isinstance(body.get('tools'), list) else None
         max_output_tokens = int(body.get('max_output_tokens', server_module.DEFAULT_MAX_TOKENS))
         temperature = float(body.get('temperature', server_module.DEFAULT_TEMPERATURE))
         top_p = float(body.get('top_p', server_module.DEFAULT_TOP_P))
@@ -434,6 +564,8 @@ def _patch_responses_routes(server_module) -> None:
         chat_messages = prior_messages + current_messages
         if instructions:
             chat_messages = [{'role': 'system', 'content': instructions}] + chat_messages
+
+        _, tool_module = _resolve_response_tools(server_module, processor, tools)
 
         template_kwargs = {
             key: value
@@ -475,6 +607,7 @@ def _patch_responses_routes(server_module) -> None:
                     'truncation': 'disabled',
                     'usage': usage,
                     'user': body.get('user'),
+                    'metadata': metadata,
                 }
                 yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': base_response}, ensure_ascii=False)}\n\n"
                 yield f"event: response.in_progress\ndata: {json.dumps({'type': 'response.in_progress', 'response': base_response}, ensure_ascii=False)}\n\n"
@@ -511,15 +644,19 @@ def _patch_responses_routes(server_module) -> None:
                         }
                         yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'delta': chunk.text}, ensure_ascii=False)}\n\n"
 
-                    final_part = {'type': 'output_text', 'text': full_text, 'annotations': []}
-                    final_item = {'id': message_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [final_part]}
+                    parsed = _parse_response_tool_result(server_module, full_text, tool_module, tools)
+                    output_items, output_text = _build_response_output_items(parsed['remaining_text'], parsed['calls'], message_id)
+                    final_part = {'type': 'output_text', 'text': output_text, 'annotations': []}
                     completed = dict(base_response)
-                    completed.update({'status': 'completed', 'output': [final_item], 'output_text': full_text, 'usage': usage})
+                    completed.update({'status': 'completed', 'output': output_items, 'output_text': output_text, 'usage': usage})
+                    if include:
+                        completed['include'] = include
                     if store:
-                        _store_response(response_id, completed, chat_messages + [{'role': 'assistant', 'content': full_text}], generated_at)
-                    yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': full_text}, ensure_ascii=False)}\n\n"
+                        _store_response(response_id, completed, chat_messages + [{'role': 'assistant', 'content': output_text}], generated_at)
+                    yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'text': output_text}, ensure_ascii=False)}\n\n"
                     yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': message_id, 'output_index': 0, 'content_index': 0, 'part': final_part}, ensure_ascii=False)}\n\n"
-                    yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': final_item}, ensure_ascii=False)}\n\n"
+                    for output_index, item in enumerate(output_items):
+                        yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': output_index, 'item': item}, ensure_ascii=False)}\n\n"
                     yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
                 except HTTPException:
                     raise
@@ -552,32 +689,33 @@ def _patch_responses_routes(server_module) -> None:
                 verbose=False,
                 **kwargs,
             )
-            response = {
-                'id': response_id,
-                'object': 'response',
-                'created_at': generated_at,
-                'status': 'completed',
-                'error': None,
-                'instructions': instructions,
-                'max_output_tokens': max_output_tokens,
-                'model': model_name,
-                'output': [_assistant_output_message(_sanitize_output_text(result.text), message_id)],
-                'output_text': _sanitize_output_text(result.text),
-                'temperature': temperature,
-                'top_p': top_p,
-                'truncation': 'disabled',
-                'usage': {
+            parsed = _parse_response_tool_result(server_module, result.text, tool_module, tools)
+            output_items, output_text = _build_response_output_items(parsed['remaining_text'], parsed['calls'], message_id)
+            response = _build_response_payload(
+                response_id=response_id,
+                generated_at=generated_at,
+                instructions=instructions,
+                max_output_tokens=max_output_tokens,
+                model_name=model_name,
+                output_items=output_items,
+                output_text=output_text,
+                temperature=temperature,
+                top_p=top_p,
+                usage={
                     'input_tokens': result.prompt_tokens,
                     'output_tokens': result.generation_tokens,
                     'total_tokens': result.total_tokens,
                 },
-                'user': body.get('user'),
-            }
+                user=body.get('user'),
+                metadata=metadata,
+            )
+            if include:
+                response['include'] = include
             if store:
                 _store_response(
                     response_id,
                     response,
-                    chat_messages + [{'role': 'assistant', 'content': _sanitize_output_text(result.text)}],
+                    chat_messages + [{'role': 'assistant', 'content': output_text}],
                     generated_at,
                 )
             server_module.mx.clear_cache()

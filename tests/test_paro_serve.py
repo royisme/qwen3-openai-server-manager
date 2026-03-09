@@ -7,8 +7,12 @@ from qwen3_server_manager.paro_serve import (
     CompatibleQwenVLMProcessor,
     _RESPONSE_STORE,
     _apply_reasoning_aliases,
+    _build_response_output_items,
     _delete_response,
+    _extract_response_include,
     _normalize_responses_input,
+    _parse_response_tool_result,
+    _response_function_call_item,
     _response_store_path,
     _save_response_store,
     _sanitize_output_text,
@@ -92,6 +96,26 @@ class ResponsesCompatTests(unittest.TestCase):
         self.assertEqual(messages, [{'role': 'assistant', 'content': 'Previous answer.'}])
         self.assertEqual(images, [])
 
+    def test_normalize_responses_input_supports_itemized_message_and_tool_output(self) -> None:
+        messages, images = _normalize_responses_input([
+            {
+                'type': 'message',
+                'role': 'user',
+                'content': [
+                    {'type': 'input_text', 'text': 'Look at this.'},
+                    {'type': 'input_image', 'image_url': {'url': 'https://example.com/b.png'}},
+                ],
+            },
+            {
+                'type': 'function_call_output',
+                'call_id': 'call_123',
+                'output': {'result': 'ok'},
+            },
+        ])
+        self.assertEqual(messages[0], {'role': 'user', 'content': 'Look at this.'})
+        self.assertEqual(messages[1], {'role': 'tool', 'content': '{"result": "ok"}'})
+        self.assertEqual(images, ['https://example.com/b.png'])
+
     def test_stored_messages_from_response_round_trip(self) -> None:
         _RESPONSE_STORE['resp_test'] = {
             'messages': [
@@ -154,3 +178,38 @@ class OutputSanitizerTests(unittest.TestCase):
     def test_sanitize_output_text_removes_special_tokens(self) -> None:
         text = 'OK<|im_end|>\n<|endoftext|>'
         self.assertEqual(_sanitize_output_text(text), 'OK\n')
+
+
+class ResponsesOutputShapeTests(unittest.TestCase):
+    def test_response_function_call_item_maps_chat_tool_call_shape(self) -> None:
+        item = _response_function_call_item({
+            'id': 'call_123',
+            'function': {'name': 'lookup_weather', 'arguments': '{"city":"Toronto"}'},
+        })
+        self.assertEqual(item['type'], 'function_call')
+        self.assertEqual(item['call_id'], 'call_123')
+        self.assertEqual(item['name'], 'lookup_weather')
+
+    def test_build_response_output_items_supports_function_calls(self) -> None:
+        items, output_text = _build_response_output_items(
+            text='Done',
+            tool_calls=[{'id': 'call_1', 'function': {'name': 'lookup', 'arguments': '{}'}}],
+            message_id='msg_1',
+        )
+        self.assertEqual(output_text, 'Done')
+        self.assertEqual(items[0]['type'], 'message')
+        self.assertEqual(items[1]['type'], 'function_call')
+
+    def test_parse_response_tool_result_sanitizes_remaining_text(self) -> None:
+        class _FakeServerModule:
+            @staticmethod
+            def process_tool_calls(model_output, tool_module, tools):
+                return {'calls': [{'id': 'call_1', 'function': {'name': 'lookup', 'arguments': '{}'}}], 'remaining_text': 'OK<|im_end|>'}
+
+        parsed = _parse_response_tool_result(_FakeServerModule, 'ignored', object(), [])
+        self.assertEqual(parsed['remaining_text'], 'OK')
+
+    def test_extract_response_include_validates_type(self) -> None:
+        self.assertEqual(_extract_response_include(['output[0].content[0].text']), ['output[0].content[0].text'])
+        with self.assertRaises(ValueError):
+            _extract_response_include('output_text')

@@ -187,9 +187,13 @@ The compatibility layer currently supports:
 
 - plain string `input`
 - message-list `input`
+- item-style `input`, including `message` items and `function_call_output` items
 - `enable_thinking: false`
 - `no_thinking: true`
 - `reasoning: {"enabled": false}` and `reasoning: {"effort": "minimal"}` as practical aliases
+- `tools` passthrough with function-call style output items when the underlying template supports tool parsing
+- `include` passthrough for common migration flows
+- `metadata` passthrough on stored responses
 - `store: true`
 - `previous_response_id` for follow-up turns
 - local disk-backed response persistence for stored responses
@@ -227,6 +231,29 @@ curl -X POST "http://127.0.0.1:8288/v1/responses" \
 ```
 
 The same behavior also works on `POST /v1/chat/completions` with either `enable_thinking: false` or `no_thinking: true`.
+
+Item-style input example:
+
+```bash
+curl -X POST "http://127.0.0.1:8288/v1/responses" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model": "z-lab/Qwen3.5-4B-PARO",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "Reply with exactly: OK"}
+        ]
+      }
+    ],
+    "max_output_tokens": 32,
+    "temperature": 0,
+    "no_thinking": true,
+    "include": ["output[0].content[0].text"]
+  }'
+```
 
 ## OpenAI-Compatible Image Request Example
 
