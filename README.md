@@ -342,3 +342,70 @@ The upstream project already provides the core serving capability, but many loca
 
 This repository exists to fill that engineering gap.
 
+## Agent Positioning
+
+The upstream `paroquant.cli.agent` can be useful for quick demos or tool-calling smoke tests.
+
+However, if you already have your own agent runtime, orchestration stack, or application backend, the more flexible approach is usually to connect directly to this OpenAI-compatible server rather than depend on the upstream demo agent runtime.
+
+---
+
+# 中文说明
+
+这是一个基于 `paroquant` 的二次开发项目，目标不是替代上游推理框架，而是将 `z-lab/Qwen3.5-4B-PARO` 封装为一个**更适合本地长期运行与集成**的 OpenAI-Compatible 服务。
+
+## 中文摘要
+
+本项目主要补齐以下工程能力：
+
+- 后台启动、停止、重启
+- 单实例管理与状态检查
+- 日志落盘与健康检查
+- 默认读取 `config/config.json`
+- 基于 `uv` 的依赖准备与运行管理
+- macOS `launchd` 服务化
+- Apple Silicon + MLX 下的图片输入支持
+- OpenAI-Compatible `responses` API 兼容增强
+
+## 默认用法
+
+```bash
+uv run qwen3-server-manager start
+uv run qwen3-server-manager status
+uv run qwen3-server-manager logs --tail 80
+```
+
+`status` 输出包含更适合服务场景的状态字段：
+
+- `mode`：直接进程或 `launchd` 服务模式
+- `lifecycle_state`：通常是 `starting`、`running` 或 `stopped`
+- `ready`：健康检查是否已经通过
+
+这有助于区分“进程已启动”与“服务已可用”这两个不同阶段，尤其适用于模型加载时间较长的场景。
+
+## 默认配置
+
+```json
+{
+  "model": "z-lab/Qwen3.5-4B-PARO",
+  "host": "127.0.0.1",
+  "port": 8288,
+  "backend": "mlx",
+  "extra_args": []
+}
+```
+
+## 适用场景
+
+本项目适合以下场景：
+
+- 作为本地 OpenAI-Compatible LLM Provider 接入现有应用或 Agent Runtime
+- 在注重隐私或成本控制的环境中提供本地推理服务
+- 在 Apple Silicon 上以 MLX 路线运行文本与图片理解请求
+- 作为对上游研究型项目进行工程化补全的参考实现
+
+## 说明
+
+- 上游项目负责核心推理能力，本项目负责本地服务化与工程化包装
+- 原始 `paroquant.cli.chat` 路径仍以文本交互为主
+- 本项目重点增强的是本地 API 服务体验，而不是重新实现模型本身
